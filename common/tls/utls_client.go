@@ -164,38 +164,61 @@ func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
 // список групп в supported_groups/key_share на explicit curve_preferences
 // пользователя — ровно тот же список, что для QUIC уже понимает
 // stdTLSConfig() ниже (общий "curve_preferences" в tls-блоке, а не
-// какая-то отдельная опция под utls). Ведущий GREASE (если он был в
-// оригинальном спеке) сохраняется первым элементом — это ничего не стоит
-// и чуть меньше отличает нас от настоящего браузера.
+// какая-то отдельная опция под utls).
 //
-// Реальную PQ-криптографию (генерацию ML-KEM-ключа и склейку с X25519,
-// если пользователь укажет X25519MLKEM768) делает не этот код, а сам
-// uTLS — внутри (*UConn).ApplyPreset() уже есть универсальный, не
-// привязанный к Chrome путь генерации key_share для любой записи
-// KeyShareExtension с пустым Data (см. случай *KeyShareExtension в
-// u_parrots.go — так же генерируется key share для HelloChrome_Auto). Мы
-// только заменяем список групп в чужом спеке — дальше всё как для Chrome.
+// Ведущий GREASE (если он был в оригинальном спеке) сохраняется только
+// когда в prefs есть хотя бы одна классическая группа. Для чистого
+// X25519MLKEM768 GREASE намеренно НЕ добавляется: иначе wire-формат
+// key_share (после re-GREASE в ApplyPreset) и serializeKeyShares(hello.KeyShares)
+// легко расходятся на 1 байт Data у GREASE-записи, и
+// client_random_prefix_secret перестаёт сходиться даже без fragment.
+//
+// Реальную PQ-криптографию (генерацию ML-KEM-ключа и склейку с X25519)
+// делает сам uTLS внутри (*UConn).ApplyPreset() для KeyShare с пустым Data.
 //
 // Возвращает false, если у спека вообще нет KeyShareExtension/
-// SupportedCurvesExtension (TLS 1.2-only паррот — заменять там нечего,
-// там нет key_share в принципе).
+// SupportedCurvesExtension (TLS 1.2-only паррот — заменять там нечего).
 func injectCurvePreferences(spec *utls.ClientHelloSpec, prefs []utls.CurveID) bool {
 	var hasCurves, hasKeyShare bool
+	keepGREASE := !prefsOnlyPostQuantum(prefs)
 	for _, ext := range spec.Extensions {
 		switch e := ext.(type) {
 		case *utls.SupportedCurvesExtension:
 			hasCurves = true
-			e.Curves = withLeadingGREASE(e.Curves, prefs)
+			if keepGREASE {
+				e.Curves = withLeadingGREASE(e.Curves, prefs)
+			} else {
+				e.Curves = append([]utls.CurveID(nil), prefs...)
+			}
 		case *utls.KeyShareExtension:
 			hasKeyShare = true
 			shares := make([]utls.KeyShare, len(prefs))
 			for i, curve := range prefs {
 				shares[i] = utls.KeyShare{Group: curve}
 			}
-			e.KeyShares = withLeadingGREASEKeyShare(e.KeyShares, shares)
+			if keepGREASE {
+				e.KeyShares = withLeadingGREASEKeyShare(e.KeyShares, shares)
+			} else {
+				e.KeyShares = shares
+			}
 		}
 	}
 	return hasCurves && hasKeyShare
+}
+
+// prefsOnlyPostQuantum — true, если в списке только гибридные/PQ группы
+// (сейчас достаточно X25519MLKEM768). Для таких списков GREASE в key_share
+// вреден для bind'а rotating prefix.
+func prefsOnlyPostQuantum(prefs []utls.CurveID) bool {
+	if len(prefs) == 0 {
+		return false
+	}
+	for _, c := range prefs {
+		if c != utls.X25519MLKEM768 {
+			return false
+		}
+	}
+	return true
 }
 
 // withLeadingGREASE/withLeadingGREASEKeyShare сохраняют ведущий
@@ -315,9 +338,10 @@ func (c *UTLSClientConfig) stdTLSConfig() *tls.Config {
 		InsecureSkipVerify: c.config.InsecureSkipVerify,
 		MinVersion:         c.config.MinVersion,
 		MaxVersion:         c.config.MaxVersion,
-		// Явно исключаем X25519MLKEM768 (Go 1.24+): без этого ClientHello весит
-		// ~1479 байт, QUIC-пакет не влезает в TUN MTU 1280 → EINVAL на Android.
-		// Если пользователь задал CurvePreferences явно — уважаем его выбор.
+		// CurvePreferences: если пользователь задал явно — уважаем его выбор.
+		// Иначе современный дефолт Go (с X25519MLKEM768).
+		// Раньше PQ вырезали из-за размера ClientHello (~1479 байт) и
+		// проблем с TUN MTU 1280 на Android. Вырезание отключено.
 		CurvePreferences: func() []tls.CurveID {
 			if len(c.config.CurvePreferences) > 0 {
 				out := make([]tls.CurveID, len(c.config.CurvePreferences))
@@ -326,7 +350,7 @@ func (c *UTLSClientConfig) stdTLSConfig() *tls.Config {
 				}
 				return out
 			}
-			return []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521}
+			return []tls.CurveID{tls.X25519MLKEM768, tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521}
 		}(),
 	}
 	if c.certDomain != "" {

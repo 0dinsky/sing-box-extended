@@ -172,54 +172,53 @@ func (l *PrefixListener) Accept() (net.Conn, error) {
 // checkRandom peeks at the TLS ClientHello and verifies the Random prefix/mask.
 // Returns the peeked bytes (always, when read succeeded) and the outcome.
 //
-// In secret (rotating) mode this now reads the WHOLE ClientHello record
-// (bounded by maxClientHelloCapture), not just the first 43 bytes, because
-// verification needs the key_share extension too — see the doc comment on
-// DeriveRotatingRandomPrefixBound for why a static (secret,window)-only check
-// is replayable by anyone who can see the wire (which, for the DPI this
-// exists to defeat, is always).
+// In secret (rotating) mode this reads the full ClientHello handshake
+// message (possibly split across several TLS records by record_fragment),
+// bounded by maxClientHelloCapture. Verification needs the key_share
+// extension — see DeriveRotatingRandomPrefixBound.
+//
+// Without multi-record assembly a pure-X25519MLKEM768 ClientHello (~1.5KB+)
+// that was split by record_fragment loses key_share in the first record and
+// fails the rotating-prefix check even though the Random itself is correct.
 func (l *PrefixListener) checkRandom(conn net.Conn) ([]byte, peekResult) {
 	if err := conn.SetReadDeadline(time.Now().Add(tlsPeekTimeout)); err != nil {
 		return nil, peekReadFailed
 	}
 	defer conn.SetReadDeadline(time.Time{}) //nolint:errcheck
 
-	header := make([]byte, 5)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return nil, peekReadFailed
+	// Assemble one logical ClientHello (handshake message) that may span
+	// multiple consecutive Handshake TLS records. Returns a synthetic
+	// single-record buffer so extractKeyShareData keeps working unchanged,
+	// plus the raw bytes actually read from the wire (for peekedConn replay).
+	wire, logical, ok := readFullClientHello(conn)
+	if !ok {
+		if len(wire) == 0 {
+			return nil, peekReadFailed
+		}
+		if len(wire) >= 1 && wire[0] != 0x16 {
+			l.logger.Debug("trusttunnel inbound: dropping non-ClientHello TCP connection")
+			return wire, peekNotClientHello
+		}
+		l.logger.Debug("trusttunnel inbound: dropping truncated/non-ClientHello TLS stream")
+		return wire, peekNotClientHello
 	}
-	if header[0] != 0x16 { // content_type = Handshake
+	if len(logical) < tlsClientRandomEnd || logical[5] != 0x01 {
 		l.logger.Debug("trusttunnel inbound: dropping non-ClientHello TCP connection")
-		return header, peekNotClientHello
-	}
-	recordLen := int(header[3])<<8 | int(header[4])
-	if recordLen <= 0 || recordLen > maxClientHelloCapture {
-		l.logger.Debug("trusttunnel inbound: dropping oversized/empty TLS record")
-		return header, peekNotClientHello
-	}
-	buf := make([]byte, 5+recordLen)
-	copy(buf, header)
-	if _, err := io.ReadFull(conn, buf[5:]); err != nil {
-		return buf[:5], peekReadFailed
-	}
-	// handshake_type = ClientHello(0x01); also guards the buf[11:43] slice below.
-	if len(buf) < tlsClientRandomEnd || buf[5] != 0x01 {
-		l.logger.Debug("trusttunnel inbound: dropping non-ClientHello TCP connection")
-		return buf, peekNotClientHello
+		return wire, peekNotClientHello
 	}
 
-	random := buf[tlsClientRandomOffset:tlsClientRandomEnd]
+	random := logical[tlsClientRandomOffset:tlsClientRandomEnd]
 
 	if len(l.secret) > 0 {
 		length := sboxtls.RandomPrefixLenOrDefault(l.prefixLen)
-		bind, ok := extractKeyShareData(buf)
+		bind, ok := extractKeyShareData(logical)
 		if !ok {
 			// A compliant TLS 1.3 ClientHello always carries key_share.
 			// No key_share means either a non-1.3 client (we require 1.3 —
 			// see min_version in the trusttunnel-in tls config) or an
 			// attacker who copied a sniffed Random into a hand-built
 			// ClientHello without one. Either way: treat like a wrong prefix.
-			return buf, peekMismatch
+			return wire, peekMismatch
 		}
 		// Accept the current window and its immediate neighbors (network
 		// delay / clock skew between client and server can put a connection
@@ -228,18 +227,89 @@ func (l *PrefixListener) checkRandom(conn net.Conn) ([]byte, peekResult) {
 		for _, window := range [3]int64{now - 1, now, now + 1} {
 			expected := sboxtls.DeriveRotatingRandomPrefixBound(l.secret, length, window, bind)
 			if bytes.Equal(random[:length], expected) {
-				return buf, peekMatched
+				return wire, peekMatched
 			}
 		}
-		return buf, peekMismatch
+		return wire, peekMismatch
 	}
 
 	for i, b := range l.prefix {
 		if random[i]&l.mask[i] != b&l.mask[i] {
-			return buf, peekMismatch
+			return wire, peekMismatch
 		}
 	}
-	return buf, peekMatched
+	return wire, peekMatched
+}
+
+// readFullClientHello reads one or more consecutive TLS Handshake records
+// until a complete ClientHello handshake message is assembled.
+//
+// wire  — exact bytes consumed from the connection (for peekedConn replay).
+// logical — synthetic single-record buffer (5-byte header + full handshake
+//           message) suitable for extractKeyShareData / Random slicing.
+// ok    — false on read error, non-handshake content, oversized payload, or
+//           incomplete message within maxClientHelloCapture.
+func readFullClientHello(conn net.Conn) (wire, logical []byte, ok bool) {
+	var wireBuf bytes.Buffer
+	var hsBuf bytes.Buffer // concatenated handshake-record payloads
+
+	// Need at least: record hdr(5) + hs type(1) + hs len(3) + enough for Random.
+	for {
+		header := make([]byte, 5)
+		if _, err := io.ReadFull(conn, header); err != nil {
+			return wireBuf.Bytes(), nil, false
+		}
+		wireBuf.Write(header)
+
+		if header[0] != 0x16 { // content_type = Handshake
+			return wireBuf.Bytes(), nil, false
+		}
+		recordLen := int(header[3])<<8 | int(header[4])
+		if recordLen <= 0 || wireBuf.Len()+recordLen > maxClientHelloCapture+5 {
+			return wireBuf.Bytes(), nil, false
+		}
+		payload := make([]byte, recordLen)
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return wireBuf.Bytes(), nil, false
+		}
+		wireBuf.Write(payload)
+		hsBuf.Write(payload)
+
+		// First record must start a ClientHello handshake message.
+		if hsBuf.Len() < 4 {
+			continue
+		}
+		hs := hsBuf.Bytes()
+		if hs[0] != 0x01 { // handshake_type = ClientHello
+			return wireBuf.Bytes(), nil, false
+		}
+		hsMsgLen := int(hs[1])<<16 | int(hs[2])<<8 | int(hs[3])
+		// Total handshake message size including its 4-byte header.
+		need := 4 + hsMsgLen
+		if need > maxClientHelloCapture {
+			return wireBuf.Bytes(), nil, false
+		}
+		if hsBuf.Len() < need {
+			// Message continues in the next Handshake record.
+			continue
+		}
+		if hsBuf.Len() > need {
+			// Extra data after ClientHello in the same record stream —
+			// shouldn't happen for a normal first flight; reject.
+			return wireBuf.Bytes(), nil, false
+		}
+
+		// Build synthetic single-record view for existing parsers.
+		msg := hs[:need]
+		logical = make([]byte, 5+len(msg))
+		logical[0] = 0x16
+		logical[1] = 0x03
+		logical[2] = 0x01
+		logical[3] = byte(len(msg) >> 8)
+		logical[4] = byte(len(msg))
+		copy(logical[5:], msg)
+		return wireBuf.Bytes(), logical, true
+	}
 }
 
 // extractKeyShareData walks a raw ClientHello handshake message (buf,
