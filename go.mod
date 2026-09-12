@@ -291,6 +291,6 @@ replace github.com/sagernet/sing-mux => github.com/shtorm-7/sing-mux v0.3.5-exte
 
 replace github.com/sagernet/quic-go => github.com/neqqz/quic-go v0.0.0-20260912152608-add3acfcf2ce
 
-replace golang.org/x/net => github.com/neqqz/net v0.0.0-20260912085310-a893f7adc7f7
+replace golang.org/x/net => github.com/neqqz/net v0.0.0-20260912165657-415bc38c88e0
 
 replace github.com/metacubex/utls => github.com/neqqz/utls v1.8.8-0.20260912142129-80833cb334c8
