@@ -293,4 +293,4 @@ replace github.com/sagernet/quic-go => github.com/neqqz/quic-go v0.0.0-202608302
 
 replace golang.org/x/net => github.com/neqqz/net v0.0.0-20260912085310-a893f7adc7f7
 
-replace github.com/metacubex/utls => github.com/neqqz/utls v1.8.8-0.20260912124735-1cf1b179562a
+replace github.com/metacubex/utls => github.com/neqqz/utls v1.8.8-0.20260912142129-80833cb334c8
